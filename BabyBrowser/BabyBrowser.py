@@ -1,5 +1,6 @@
 import os
 import unittest
+import numpy
 from __main__ import vtk, qt, ctk, slicer
 from slicer.ScriptedLoadableModule import *
 
@@ -169,6 +170,7 @@ class BabyBrowserLogic(ScriptedLoadableModuleLogic):
                         "year4-5",
                         "year5-6",
                         ]
+    self.agesInYears = [ 0., 2./52., 3./12., 6./12., 9./12., 1., 2., 3., 4., 5. ]
     self.volumesByTypeAndAge = {}
 
 
@@ -186,7 +188,6 @@ class BabyBrowserLogic(ScriptedLoadableModuleLogic):
 
 
   def loadDevelopmentalAtlas(self):
-    import numpy
 
     # get the header - this reader doesn't support 4D
     # but can query the header.
@@ -227,6 +228,13 @@ class BabyBrowserLogic(ScriptedLoadableModuleLogic):
     # create the multivolume node and display it
     multiVolumeNode = slicer.vtkMRMLMultiVolumeNode()
 
+    volumeLabels = vtk.vtkDoubleArray()
+    volumeLabels.SetNumberOfTuples(frames)
+    volumeLabels.SetNumberOfComponents(1)
+    volumeLabels.Allocate(frames)
+    for frame in xrange(frames):
+      volumeLabels.SetComponent(frame,0,self.agesInYears[frame])
+
     multiVolumeNode.SetScene(slicer.mrmlScene)
 
     multiVolumeDisplayNode = slicer.mrmlScene.CreateNodeByClass('vtkMRMLMultiVolumeDisplayNode')
@@ -239,10 +247,73 @@ class BabyBrowserLogic(ScriptedLoadableModuleLogic):
     multiVolumeNode.SetAndObserveImageData(image)
     multiVolumeNode.SetNumberOfFrames(frames)
     multiVolumeNode.SetName("DevelopmentalAtlas")
-    multiVolumeNode.SetAttribute("MultiVolume.FrameLabels", str(self.timePoints)[1:-1])
+    multiVolumeNode.SetLabelArray(volumeLabels)
+    multiVolumeNode.SetLabelName("Years")
+    multiVolumeNode.SetAttribute("MultiVolume.FrameLabels", str(self.agesInYears)[1:-1])
+    multiVolumeNode.SetAttribute("MultiVolume.NumberOfFrames", str(frames))
+    multiVolumeNode.SetAttribute("MultiVolume.FrameIdentifyingDICOMTagName", "Age")
+    multiVolumeNode.SetAttribute("MultiVolume.FrameIdentifyingDICOMTagUnits", "(Years)")
     slicer.mrmlScene.AddNode(multiVolumeNode)
 
     return multiVolumeNode
+
+
+  def fit(self,atlasName='DevelopmentalAtlas', range=[0,5]):
+    """
+    Create a volume of the slope across the range of years.
+
+    least squares notation from:
+    http://docs.scipy.org/doc/numpy/reference/generated/numpy.linalg.lstsq.html
+    """
+    ijkToRAS = vtk.vtkMatrix4x4()
+    atlasVolume = slicer.util.getNode(atlasName)
+    atlasVolume.GetIJKToRASMatrix(ijkToRAS)
+    fitVolume = slicer.vtkMRMLScalarVolumeNode()
+    fitVolume.SetIJKToRASMatrix(ijkToRAS)
+    ageRange = str(range).replace('[','(').replace(']',')')
+    fitName = 'Slope_'+ageRange+'_'+atlasName
+    fitVolume.SetName(fitName)
+
+    colorNode = slicer.vtkMRMLColorTableNode()
+    colorNode.SetTypeToGrey()
+    slicer.mrmlScene.AddNode(colorNode)
+
+    fitDisplayNode = slicer.vtkMRMLScalarVolumeDisplayNode()
+    fitDisplayNode.SetAutoWindowLevel(False)
+    fitDisplayNode.SetWindow(10)
+    fitDisplayNode.SetLevel(45)
+    slicer.mrmlScene.AddNode(fitDisplayNode)
+    fitDisplayNode.SetAndObserveColorNodeID(colorNode.GetID())
+
+    fitImage = vtk.vtkImageData()
+    fitImage.ShallowCopy(atlasVolume.GetImageData())
+    fitImage.AllocateScalars(vtk.VTK_FLOAT, 1)
+    fitVolume.SetAndObserveImageData(fitImage)
+
+    slicer.mrmlScene.AddNode(fitVolume)
+    fitVolume.SetAndObserveDisplayNodeID(fitDisplayNode.GetID())
+
+    fitArray = slicer.util.array(fitName)
+    atlasArray = slicer.util.array(atlasName)
+
+    # make a regression against a scale more or less like the multivolume plot
+    timePoints = self.agesInYears[range[0]:range[1]]
+    timePoints = map(lambda x : x * 1000., timePoints)
+    A = numpy.vstack([timePoints, numpy.ones(len(timePoints))]).T
+
+    slices, rows, columns, frames = atlasArray.shape
+    for slice in xrange(slices):
+      for row in xrange(rows):
+        for column in xrange(columns):
+          if atlasArray[slice, row, column, 0] == 0:
+            fit = 0
+          else:
+            series = atlasArray[slice, row, column][range[0]:range[1]]
+            slope, intercept = numpy.linalg.lstsq(A, series)[0]
+            fit = -1. * numpy.degrees(numpy.arctan(slope))
+          fitArray[slice, row, column] = fit
+
+    return fitVolume
 
 
 class BabyBrowserTest(ScriptedLoadableModuleTest):
@@ -274,14 +345,24 @@ class BabyBrowserTest(ScriptedLoadableModuleTest):
     logic.loadDevelopmentalAtlas()
 
     self.delayDisplay("Loading native space atlas",100)
-    logic.loadAtlas()
+    try:
+      logic.loadAtlas()
+    except:
+      pass
+
+    ranges = [ [0, 10] ]
+    ranges = [ [0,3], [0, 5], [0, 10] ]
+    for range in ranges:
+      self.delayDisplay('range ' + str(range), 50)
+      fitVolume = logic.fit(range=range)
+
 
     #
     # automatically select the volume to display
     #
     appLogic = slicer.app.applicationLogic()
     selNode = appLogic.GetSelectionNode()
-    selNode.SetReferenceActiveVolumeID(multiVolumeNode.GetID())
+    selNode.SetReferenceActiveVolumeID(fitVolume.GetID())
     appLogic.PropagateVolumeSelection()
 
 
